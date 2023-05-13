@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -13,16 +14,119 @@
 #include <syslog.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
+#include "queue.h"
 
 #define BUF_SIZE 512
 #define SOCKET_DATA_FILE "/var/tmp/aesdsocketdata"
 
+struct thread_arg_t {
+    int connfd;
+};
+
+struct thread_node_t {
+    pthread_t thread;
+    SLIST_ENTRY(thread_node_t) entry;
+};
+
+SLIST_HEAD(thread_head_t, thread_node_t);
+
 int is_shutdown = false;
+pthread_mutex_t mutex;
 
 void sig_handler(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
         is_shutdown = true;
     }
+}
+
+void timer_hander(union sigval v) {
+    char buf[128];
+    time_t t = time(NULL);
+    struct tm *lt = localtime(&t);
+    if (lt == NULL) {
+        perror("localtime");
+        exit(-1);
+    }
+    if (strftime(buf, sizeof(buf), "%a, %d %b %Y %T %z", lt) == 0) {
+        fprintf(stderr, "strftime return 0");
+        exit(-1);
+    }
+
+    int fd = open(SOCKET_DATA_FILE, O_RDWR | O_APPEND | O_CREAT, 0644);
+    if (fd == -1) {
+        perror("open");
+        exit(-1);
+    }
+    if (pthread_mutex_lock(&mutex)) {
+        fprintf(stderr, "pthread_mutex_lock error\n");
+        exit(-1);
+    }
+    char out[256];
+    sprintf(out, "timestamp: %s\n", buf);
+    size_t len = strlen(out);
+    if (write(fd, out, len) < len) {
+        fprintf(stderr, "write return less");
+        exit(-1);
+    }
+    if (pthread_mutex_unlock(&mutex)) {
+        fprintf(stderr, "pthread_mutex_unlock error\n");
+        exit(-1);
+    }
+}
+
+void *conn_thread(void *arg) {
+    struct thread_arg_t *thread_arg = (struct thread_arg_t*)arg;
+    int connfd = thread_arg->connfd;
+    char buf[BUF_SIZE];
+
+    int fd = open(SOCKET_DATA_FILE, O_RDWR | O_APPEND | O_CREAT, 0644);
+    if (fd == -1) {
+        perror("open");
+        exit(-1);
+    }
+
+    ssize_t n;
+    if (pthread_mutex_lock(&mutex)) {
+        fprintf(stderr, "pthread_mutex_lock error\n");
+        exit(-1);
+    }
+    while ((n = recv(connfd, buf, sizeof(buf)-1, 0)) > 0) {
+        // buf[n] = '\0';
+        // printf("receive: %s\n", buf);
+        if (write(fd, buf, n) < n)
+            exit(-1);
+        if (buf[n-1] == '\n')
+            break;
+    }
+    if (pthread_mutex_unlock(&mutex)) {
+        fprintf(stderr, "pthread_mutex_unlock error\n");
+        exit(-1);
+    }
+    if (n == -1) {
+        perror("recv");
+        pthread_exit(NULL);
+    }
+
+    if (lseek(fd, SEEK_SET, 0) == -1) {
+        perror("lseek");
+        exit(-1);
+    }
+    while ((n = read(fd, buf, sizeof(buf)-1)) > 0) {
+        if (send(connfd, buf, n, 0) < n) {
+            fprintf(stderr, "send return < n\n");
+            exit(-1);
+        }
+    }
+    if (n == -1) {
+        perror("read");
+        exit(-1);
+    }
+
+    close(connfd);
+    close(fd);
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -38,7 +142,6 @@ int main(int argc, char *argv[]) {
 
     int ret;
     int sfd;
-    char buf[BUF_SIZE];
 
     openlog("aesdsocket", LOG_CONS, LOG_USER);
     
@@ -50,6 +153,27 @@ int main(int argc, char *argv[]) {
     }
     if (sigaction(SIGTERM, &sigact, NULL) == -1) {
         perror("sigaction");
+        exit(-1);
+    }
+
+    // Timer
+    timer_t timerid;
+    struct sigevent sev;
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_value.sival_ptr = &timerid;
+    sev.sigev_notify_function = timer_hander;
+    sev.sigev_notify_attributes = NULL;
+    if (timer_create(CLOCK_MONOTONIC, &sev, &timerid) == -1) {
+        perror("timer_create");
+        exit(-1);
+    }
+    struct itimerspec its;
+    its.it_value.tv_sec = 10;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = its.it_value.tv_sec;
+    its.it_interval.tv_nsec = its.it_value.tv_nsec;
+    if (timer_settime(timerid, 0, &its, NULL) == -1) {
+        perror("timer_settime");
         exit(-1);
     }
 
@@ -89,6 +213,9 @@ int main(int argc, char *argv[]) {
         exit(-1);
     }
 
+    struct thread_head_t *thread_head = malloc(sizeof(struct thread_head_t));
+    SLIST_INIT(thread_head);
+    pthread_mutex_init(&mutex, 0);
 
     while (!is_shutdown) {
         struct sockaddr_in addr;
@@ -100,46 +227,39 @@ int main(int argc, char *argv[]) {
         }
         syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(addr.sin_addr));
 
-        int fd = open(SOCKET_DATA_FILE, O_RDWR | O_APPEND | O_CREAT, 0644);
-        if (fd == -1) {
-            perror("open");
+        struct thread_node_t *node = malloc(sizeof(struct thread_node_t));
+
+        struct thread_arg_t *arg = malloc(sizeof(struct thread_arg_t));
+        arg->connfd = connfd;
+        if (pthread_create(&node->thread, NULL, conn_thread, arg)) {
+            fprintf(stderr, "pthread_create error\n");
             exit(-1);
         }
+        SLIST_INSERT_HEAD(thread_head, node, entry);
 
-        ssize_t n;
-        while ((n = recv(connfd, buf, sizeof(buf)-1, 0)) > 0) {
-            // buf[n] = '\0';
-            // printf("receive: %s\n", buf);
-            if (write(fd, buf, n) < n)
-                exit(-1);
-            if (buf[n-1] == '\n')
-                break;
-        }
-        if (n == -1) {
-            perror("recv");
-            continue;
-        }
-
-        if (lseek(fd, SEEK_SET, 0) == -1) {
-            perror("lseek");
-            exit(-1);
-        }
-        while ((n = read(fd, buf, sizeof(buf)-1)) > 0) {
-            if (send(connfd, buf, n, 0) < n) {
-                fprintf(stderr, "send return < n\n");
-                exit(-1);
+        struct thread_node_t *tmp;
+        SLIST_FOREACH_SAFE (node, thread_head, entry, tmp) {
+            if (pthread_tryjoin_np(node->thread, NULL)) {
+                SLIST_REMOVE(thread_head, node, thread_node_t, entry);
+                free(node);
             }
         }
-        if (n == -1) {
-            perror("read");
-            exit(-1);
-        }
-
-        close(connfd);
-        close(fd);
     }
 
     syslog(LOG_INFO, "Caught signal, exiting");
+
+
+    struct thread_node_t *node, *tmp;
+    SLIST_FOREACH_SAFE (node, thread_head, entry, tmp) {
+        pthread_join(node->thread, NULL);
+        SLIST_REMOVE(thread_head, node, thread_node_t, entry);
+        free(node);
+    }
+    free(thread_head);
+
+    pthread_mutex_destroy(&mutex);
+
+    timer_delete(timerid);
 
     if (access(SOCKET_DATA_FILE, F_OK) == 0)
         if (remove(SOCKET_DATA_FILE) == -1) {
